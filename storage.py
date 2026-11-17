@@ -10,9 +10,6 @@ Original file is located at
 """storage.py - persistence for the Online Food Ordering System.
 
 Two backends share one interface, chosen automatically:
-
-* Browser (Pyodide on the GitHub Pages site): data lives in the browser's
-  localStorage, so each visitor keeps their own accounts, cart and orders.
 * Desktop / command line: data is stored as JSON files inside a `data/`
   folder next to this file. Set the FOOD_APP_DATA environment variable to use
   a different folder (the unit tests do this).
@@ -41,3 +38,40 @@ def data_dir() -> str:
 
 def _path(name: str) -> str:
     return os.path.join(data_dir(), f"{name}.json")
+
+
+# ------------------------------ public API --------------------------------
+def load(name: str, default):
+    """Load `name`, returning `default` if missing or corrupted."""
+    if BROWSER:
+        try:
+            raw = localStorage.getItem(_PREFIX + name)
+        except Exception:
+            raw = _memory.get(name)
+        if not isinstance(raw, str):  # missing key (null/None) or unavailable
+            return default
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return default
+    try:
+        with open(_path(name), encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return default
+
+
+def save(name: str, data) -> None:
+    """Persist `data` under `name` (atomic write when using files)."""
+    if BROWSER:
+        text = json.dumps(data, ensure_ascii=False)
+        try:
+            localStorage.setItem(_PREFIX + name, text)
+        except Exception:
+            _memory[name] = text
+        return
+    os.makedirs(data_dir(), exist_ok=True)
+    tmp = _path(name) + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, _path(name))
