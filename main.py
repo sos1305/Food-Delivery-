@@ -1,0 +1,321 @@
+"""main.py - command-line interface for the Online Food Ordering System.
+
+Run with:  python main.py
+Default admin login:  admin / admin123
+"""
+import sys
+
+from models import ORDER_FLOW, CANCELLED, PAYMENT_METHODS
+from services import (COUPONS, AuthService, Cart, MenuService, OrderService,
+                      calculate_bill)
+
+LINE = "-" * 62
+
+
+# ----------------------------- input helpers ------------------------------
+def ask(prompt: str) -> str:
+    try:
+        return input(prompt).strip()
+    except EOFError:
+        print("\nInput ended. Goodbye!")
+        sys.exit(0)
+
+
+def ask_int(prompt: str, default=None):
+    raw = ask(prompt)
+    if raw == "" and default is not None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        raise ValueError("Please enter a whole number.")
+
+
+def ask_float(prompt: str) -> float:
+    try:
+        return float(ask(prompt))
+    except ValueError:
+        raise ValueError("Please enter a valid number.")
+
+
+def safe(action):
+    """Run `action`, printing any validation error instead of crashing."""
+    try:
+        action()
+    except ValueError as err:
+        print(f"  ! {err}")
+
+
+# ------------------------------ display -----------------------------------
+def show_items(items):
+    if not items:
+        print("  No items match.")
+        return
+    current = None
+    for it in items:
+        if it.category != current:
+            current = it.category
+            print(f"\n  [{current}]")
+        tag = "VEG " if it.veg else "NON "
+        note = "" if it.available else "  (unavailable)"
+        print(f"   {it.id:>3}. {it.name:<24} Rs.{it.price:>7.2f}  {tag}{note}")
+    print()
+
+
+def show_cart(cart: Cart, coupon=""):
+    if cart.is_empty():
+        print("  Your cart is empty.")
+        return
+    print(LINE)
+    for r in cart.detail():
+        print(f"  {r['item_id']:>3}. {r['name']:<24} {r['qty']:>2} x Rs.{r['price']:>7.2f}"
+              f" = Rs.{r['qty'] * r['price']:>8.2f}")
+    print(LINE)
+    show_bill(calculate_bill(cart.subtotal(), coupon))
+
+
+def show_bill(bill: dict):
+    print(f"  Subtotal      : Rs.{bill['subtotal']:>9.2f}")
+    if bill["discount"]:
+        print(f"  Discount      : -Rs.{bill['discount']:>8.2f}")
+    print(f"  GST (5%)      : Rs.{bill['tax']:>9.2f}")
+    print(f"  Delivery fee  : Rs.{bill['delivery_fee']:>9.2f}")
+    print(f"  TOTAL         : Rs.{bill['total']:>9.2f}")
+
+
+def show_order(o, detailed=True):
+    print(f"\n  Order #{o.id}  |  {o.created_at}  |  {o.status}  |  Rs.{o.total:.2f}")
+    if detailed:
+        for line in o.items:
+            print(f"     - {line['name']} x{line['qty']}")
+        print(f"     Deliver to: {o.address}   Payment: {o.payment_method}"
+              + (f"   Coupon: {o.coupon}" if o.coupon else ""))
+        if o.rating:
+            print(f"     Rating: {o.rating}/5 {('- ' + o.review) if o.review else ''}")
+
+
+def show_tracking(o):
+    if o.status == CANCELLED:
+        print(f"  Order #{o.id} was CANCELLED.")
+        return
+    idx = ORDER_FLOW.index(o.status)
+    steps = [("[x] " if i <= idx else "[ ] ") + s for i, s in enumerate(ORDER_FLOW)]
+    print(f"  Order #{o.id}: " + "  ->  ".join(steps))
+
+
+# --------------------------- customer features ----------------------------
+def browse_menu(menu: MenuService):
+    print("\n  Filters (press Enter to skip each)")
+    print(f"  Categories: {', '.join(menu.categories())}")
+    query = ask("  Search by name : ")
+    category = ask("  Category       : ")
+    veg_only = ask("  Veg only? (y/N): ").lower() == "y"
+    mp = ask("  Max price      : ")
+    max_price = float(mp) if mp else None
+    show_items(menu.search(query, category, veg_only, max_price))
+
+
+def manage_cart(menu: MenuService, cart: Cart, coupon_holder: dict):
+    while True:
+        print("\n  --- CART ---")
+        show_cart(cart, coupon_holder["code"])
+        print("  1. Add item   2. Change quantity   3. Remove item   "
+              "4. Apply coupon   5. Clear   0. Back")
+        choice = ask("  > ")
+        if choice == "1":
+            safe(lambda: cart.add(ask_int("  Item id: "), ask_int("  Quantity [1]: ", 1)))
+        elif choice == "2":
+            safe(lambda: cart.set_qty(ask_int("  Item id: "), ask_int("  New quantity (0 removes): ")))
+        elif choice == "3":
+            safe(lambda: cart.remove(ask_int("  Item id: ")))
+        elif choice == "4":
+            apply_coupon_flow(cart, coupon_holder)
+        elif choice == "5":
+            cart.clear()
+            coupon_holder["code"] = ""
+        elif choice == "0":
+            return
+        else:
+            print("  ! Invalid option.")
+
+
+def apply_coupon_flow(cart: Cart, coupon_holder: dict):
+    print("  Available coupons:")
+    for code, rule in COUPONS.items():
+        print(f"   {code:<10} {rule['desc']}")
+    code = ask("  Enter code (blank to remove): ").upper()
+
+    def _apply():
+        if code:
+            calculate_bill(cart.subtotal(), code)  # validates, raises if invalid
+        coupon_holder["code"] = code
+        print("  Coupon applied." if code else "  Coupon removed.")
+    safe(_apply)
+
+
+def checkout(user, auth, orders: OrderService, cart: Cart, coupon_holder: dict):
+    if cart.is_empty():
+        print("  ! Your cart is empty.")
+        return
+    show_cart(cart, coupon_holder["code"])
+    default_addr = user.address
+    addr = ask(f"  Delivery address [{default_addr or 'required'}]: ") or default_addr
+    pay = ask(f"  Payment method ({'/'.join(PAYMENT_METHODS)}) [COD]: ") or "COD"
+    if ask("  Confirm order? (y/N): ").lower() != "y":
+        print("  Checkout cancelled.")
+        return
+
+    def _place():
+        order = orders.place_order(user.username, cart, addr, pay, coupon_holder["code"])
+        coupon_holder["code"] = ""
+        if addr and addr != user.address:
+            auth.update_address(user.username, addr)
+        print(f"\n  Order placed! Your order id is #{order.id}. Total Rs.{order.total:.2f}")
+    safe(_place)
+
+
+def order_history(user, orders: OrderService):
+    history = orders.history(user.username)
+    if not history:
+        print("  You have no orders yet.")
+        return
+    for o in history:
+        show_order(o)
+
+
+def track_order(user, orders: OrderService):
+    safe(lambda: show_tracking(orders.get(ask_int("  Order id: "), user.username)))
+
+
+def cancel_order(user, orders: OrderService):
+    def _cancel():
+        o = orders.cancel(ask_int("  Order id to cancel: "), user.username)
+        print(f"  Order #{o.id} cancelled.")
+    safe(_cancel)
+
+
+def rate_order(user, orders: OrderService):
+    def _rate():
+        oid = ask_int("  Order id: ")
+        rating = ask_int("  Rating (1-5): ")
+        orders.rate(oid, user.username, rating, ask("  Review (optional): "))
+        print("  Thanks for your feedback!")
+    safe(_rate)
+
+
+def customer_session(user, auth, menu, orders):
+    cart = Cart(menu)
+    coupon_holder = {"code": ""}
+    while True:
+        print(f"\n{LINE}\n  Hello, {user.username}!  Cart items: {sum(cart.lines.values())}\n{LINE}")
+        print("  1. Browse / search menu      5. Track an order")
+        print("  2. Manage cart               6. Cancel an order")
+        print("  3. Checkout                  7. Rate a delivered order")
+        print("  4. Order history             0. Logout")
+        choice = ask("  > ")
+        if choice == "1":
+            safe(lambda: browse_menu(menu))
+        elif choice == "2":
+            manage_cart(menu, cart, coupon_holder)
+        elif choice == "3":
+            checkout(user, auth, orders, cart, coupon_holder)
+        elif choice == "4":
+            order_history(user, orders)
+        elif choice == "5":
+            track_order(user, orders)
+        elif choice == "6":
+            cancel_order(user, orders)
+        elif choice == "7":
+            rate_order(user, orders)
+        elif choice == "0":
+            return
+        else:
+            print("  ! Invalid option.")
+
+
+# ----------------------------- admin features -----------------------------
+def admin_session(menu: MenuService, orders: OrderService):
+    while True:
+        print(f"\n{LINE}\n  ADMIN PANEL\n{LINE}")
+        print("  1. View full menu          5. Toggle item availability")
+        print("  2. Add menu item           6. Remove menu item")
+        print("  3. Update item price       7. View all orders")
+        print("  4. Update order status     8. Sales report")
+        print("  0. Logout")
+        choice = ask("  > ")
+        if choice == "1":
+            show_items(menu.search(include_unavailable=True))
+        elif choice == "2":
+            def _add():
+                item = menu.add_item(ask("  Name: "), ask("  Category: "),
+                                     ask_float("  Price: "),
+                                     ask("  Veg? (Y/n): ").lower() != "n")
+                print(f"  Added '{item.name}' with id {item.id}.")
+            safe(_add)
+        elif choice == "3":
+            safe(lambda: menu.update_price(ask_int("  Item id: "), ask_float("  New price: ")))
+        elif choice == "4":
+            def _status():
+                oid = ask_int("  Order id: ")
+                print(f"  Statuses: {', '.join(ORDER_FLOW)}")
+                o = orders.update_status(oid, ask("  New status: "))
+                print(f"  Order #{o.id} is now {o.status}.")
+            safe(_status)
+        elif choice == "5":
+            def _toggle():
+                state = menu.toggle_availability(ask_int("  Item id: "))
+                print("  Item is now " + ("available." if state else "unavailable."))
+            safe(_toggle)
+        elif choice == "6":
+            safe(lambda: menu.remove_item(ask_int("  Item id: ")))
+        elif choice == "7":
+            for o in sorted(orders.orders.values(), key=lambda o: o.id, reverse=True):
+                show_order(o, detailed=False)
+                print(f"     Customer: {o.username}")
+            if not orders.orders:
+                print("  No orders yet.")
+        elif choice == "8":
+            r = orders.sales_report()
+            print(f"\n  Total orders : {r['total_orders']}  (cancelled: {r['cancelled']})")
+            print(f"  Revenue      : Rs.{r['revenue']:.2f}")
+            print(f"  Avg rating   : {r['avg_rating'] if r['avg_rating'] else 'n/a'}")
+            print("  Top items    : " + (", ".join(f"{n} ({q})" for n, q in r["top_items"]) or "n/a"))
+        elif choice == "0":
+            return
+        else:
+            print("  ! Invalid option.")
+
+
+# --------------------------------- main -----------------------------------
+def main():
+    auth, menu = AuthService(), MenuService()
+    orders = OrderService(menu)
+    print("=" * 62)
+    print("        WELCOME TO PYTHON BITES - ONLINE FOOD ORDERING")
+    print("=" * 62)
+    while True:
+        print("\n  1. Login   2. Register   0. Exit")
+        choice = ask("  > ")
+        if choice == "1":
+            def _login():
+                user = auth.login(ask("  Username: "), ask("  Password: "))
+                if user.role == "admin":
+                    admin_session(menu, orders)
+                else:
+                    customer_session(user, auth, menu, orders)
+            safe(_login)
+        elif choice == "2":
+            def _register():
+                auth.register(ask("  Choose a username: "), ask("  Choose a password: "),
+                              ask("  Phone (10 digits, optional): "), ask("  Address (optional): "))
+                print("  Registration successful. You can now log in.")
+            safe(_register)
+        elif choice == "0":
+            print("  Thank you for visiting. Goodbye!")
+            return
+        else:
+            print("  ! Invalid option.")
+
+
+if __name__ == "__main__":
+    main()
