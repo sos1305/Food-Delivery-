@@ -192,3 +192,179 @@ class MenuService:
         self.get(item_id)
         del self.items[item_id]
         self._save()
+
+
+# --------------------------------------------------------------------------
+# 3. Cart
+# --------------------------------------------------------------------------
+class Cart:
+    def __init__(self, menu: MenuService):
+        self.menu = menu
+        self.lines = {}  # item_id -> qty
+
+    def add(self, item_id: int, qty: int = 1):
+        item = self.menu.get(item_id)
+        if not item.available:
+            raise ValueError(f"{item.name} is currently unavailable.")
+        if qty < 1:
+            raise ValueError("Quantity must be at least 1.")
+        new_qty = self.lines.get(item_id, 0) + qty
+        if new_qty > 20:
+            raise ValueError("You can order at most 20 of one item.")
+        self.lines[item_id] = new_qty
+
+    def set_qty(self, item_id: int, qty: int):
+        if item_id not in self.lines:
+            raise ValueError("That item is not in your cart.")
+        if qty <= 0:
+            del self.lines[item_id]
+        elif qty > 20:
+            raise ValueError("You can order at most 20 of one item.")
+        else:
+            self.lines[item_id] = qty
+
+    def remove(self, item_id: int):
+        if item_id not in self.lines:
+            raise ValueError("That item is not in your cart.")
+        del self.lines[item_id]
+
+    def clear(self):
+        self.lines.clear()
+
+    def is_empty(self) -> bool:
+        return not self.lines
+
+    def detail(self):
+        rows = []
+        for item_id, qty in self.lines.items():
+            item = self.menu.get(item_id)
+            rows.append({"item_id": item_id, "name": item.name,
+                         "price": item.price, "qty": qty})
+        return rows
+
+    def subtotal(self) -> float:
+        return round(sum(r["price"] * r["qty"] for r in self.detail()), 2)
+
+
+# --------------------------------------------------------------------------
+# 4. Billing & coupons
+# --------------------------------------------------------------------------
+def apply_coupon(code: str, subtotal: float) -> float:
+    """Return the discount for `code`, or raise ValueError if not applicable."""
+    rule = COUPONS.get(code.strip().upper())
+    if not rule:
+        raise ValueError("Invalid coupon code.")
+    if subtotal < rule["min"]:
+        raise ValueError(f"Coupon needs a minimum order of Rs.{rule['min']}.")
+    if rule["kind"] == "percent":
+        discount = subtotal * rule["value"] / 100
+        if rule["cap"]:
+            discount = min(discount, rule["cap"])
+    else:
+        discount = rule["value"]
+    return round(min(discount, subtotal), 2)
+
+
+def calculate_bill(subtotal: float, coupon_code: str = "") -> dict:
+    discount = apply_coupon(coupon_code, subtotal) if coupon_code else 0.0
+    taxable = subtotal - discount
+    delivery = 0.0 if taxable >= FREE_DELIVERY_ABOVE or taxable == 0 else DELIVERY_FEE
+    tax = round(taxable * GST_RATE, 2)
+    total = round(taxable + tax + delivery, 2)
+    return {"subtotal": round(subtotal, 2), "discount": discount,
+            "delivery_fee": delivery, "tax": tax, "total": total}
+
+
+# --------------------------------------------------------------------------
+# 5-7. Orders
+# --------------------------------------------------------------------------
+class OrderService:
+    def __init__(self, menu: MenuService):
+        self.menu = menu
+        self.orders = {o["id"]: Order(**o) for o in storage.load("orders", [])}
+
+    def _save(self):
+        storage.save("orders", [o.to_dict() for o in self.orders.values()])
+
+    def place_order(self, username, cart: Cart, address, payment_method,
+                    coupon_code="") -> Order:
+        if cart.is_empty():
+            raise ValueError("Your cart is empty.")
+        if not address.strip():
+            raise ValueError("A delivery address is required.")
+        payment_method = payment_method.strip().upper()
+        if payment_method not in PAYMENT_METHODS:
+            raise ValueError(f"Payment method must be one of {', '.join(PAYMENT_METHODS)}.")
+        for row in cart.detail():
+            if not self.menu.get(row["item_id"]).available:
+                raise ValueError(f"{row['name']} just became unavailable. Please update your cart.")
+        bill = calculate_bill(cart.subtotal(), coupon_code)
+        order = Order(
+            id=max(self.orders, default=1000) + 1,
+            username=username,
+            items=cart.detail(),
+            address=address.strip(),
+            payment_method=payment_method,
+            coupon=coupon_code.strip().upper(),
+            **bill,
+        )
+        self.orders[order.id] = order
+        self._save()
+        cart.clear()
+        return order
+
+    def history(self, username):
+        return sorted((o for o in self.orders.values() if o.username == username),
+                      key=lambda o: o.id, reverse=True)
+
+    def get(self, order_id: int, username=None) -> Order:
+        order = self.orders.get(order_id)
+        if not order or (username and order.username != username):
+            raise ValueError("Order not found.")
+        return order
+
+    def cancel(self, order_id: int, username: str) -> Order:
+        order = self.get(order_id, username)
+        if order.status != "PLACED":
+            raise ValueError("Only orders that are still in PLACED status can be cancelled.")
+        order.status = CANCELLED
+        self._save()
+        return order
+
+    def update_status(self, order_id: int, new_status: str) -> Order:
+        order = self.get(order_id)
+        new_status = new_status.strip().upper()
+        if order.status in (CANCELLED, "DELIVERED"):
+            raise ValueError(f"Order is already {order.status}.")
+        if new_status not in ORDER_FLOW:
+            raise ValueError(f"Status must be one of {', '.join(ORDER_FLOW)}.")
+        if ORDER_FLOW.index(new_status) <= ORDER_FLOW.index(order.status):
+            raise ValueError("Status can only move forward.")
+        order.status = new_status
+        self._save()
+        return order
+
+    def rate(self, order_id: int, username: str, rating: int, review: str = "") -> Order:
+        order = self.get(order_id, username)
+        if order.status != "DELIVERED":
+            raise ValueError("You can only rate delivered orders.")
+        if not 1 <= rating <= 5:
+            raise ValueError("Rating must be between 1 and 5.")
+        order.rating, order.review = rating, review.strip()
+        self._save()
+        return order
+
+    def sales_report(self) -> dict:
+        valid = [o for o in self.orders.values() if o.status != CANCELLED]
+        counter = Counter()
+        for o in valid:
+            for line in o.items:
+                counter[line["name"]] += line["qty"]
+        ratings = [o.rating for o in valid if o.rating]
+        return {
+            "total_orders": len(self.orders),
+            "cancelled": len(self.orders) - len(valid),
+            "revenue": round(sum(o.total for o in valid), 2),
+            "top_items": counter.most_common(3),
+            "avg_rating": round(sum(ratings) / len(ratings), 2) if ratings else None,
+        }
