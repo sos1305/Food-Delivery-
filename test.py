@@ -77,3 +77,110 @@ class FoodAppTests(unittest.TestCase):
         self.menu.toggle_availability(1)
         with self.assertRaises(ValueError):
             s.Cart(self.menu).add(1)
+
+    # --- orders ---
+    def _place(self):
+        cart = s.Cart(self.menu)
+        cart.add(4, 2)
+        return self.orders.place_order("amit", cart, "Delhi", "upi", "WELCOME10"), cart
+
+    def test_place_order_clears_cart(self):
+        order, cart = self._place()
+        self.assertTrue(cart.is_empty())
+        self.assertEqual(order.status, "PLACED")
+        self.assertEqual(order.payment_method, "UPI")
+        self.assertEqual(len(self.orders.history("amit")), 1)
+
+    def test_empty_cart_rejected(self):
+        with self.assertRaises(ValueError):
+            self.orders.place_order("amit", s.Cart(self.menu), "Delhi", "COD")
+
+    def test_status_flow_and_rating(self):
+        order, _ = self._place()
+        with self.assertRaises(ValueError):
+            self.orders.rate(order.id, "amit", 5)  # not delivered yet
+        for status in ("PREPARING", "OUT_FOR_DELIVERY", "DELIVERED"):
+            self.orders.update_status(order.id, status)
+        with self.assertRaises(ValueError):
+            self.orders.update_status(order.id, "PLACED")
+        self.orders.rate(order.id, "amit", 5, "Great!")
+        self.assertEqual(self.orders.get(order.id).rating, 5)
+
+    def test_cancel_only_when_placed(self):
+        order, _ = self._place()
+        self.orders.update_status(order.id, "PREPARING")
+        with self.assertRaises(ValueError):
+            self.orders.cancel(order.id, "amit")
+
+    def test_orders_persist_and_report(self):
+        order, _ = self._place()
+        reloaded = s.OrderService(self.menu)
+        self.assertIn(order.id, reloaded.orders)
+        report = reloaded.sales_report()
+        self.assertEqual(report["total_orders"], 1)
+        self.assertEqual(report["top_items"][0], ("Butter Chicken", 2))
+
+    def test_cannot_view_others_orders(self):
+        order, _ = self._place()
+        with self.assertRaises(ValueError):
+            self.orders.get(order.id, "someone_else")
+
+
+class WebApiTests(unittest.TestCase):
+    """Tests for api.py, the layer the website talks to."""
+
+    def setUp(self):
+        for f in os.listdir(storage.data_dir()):
+            os.remove(os.path.join(storage.data_dir(), f))
+        import api
+        self.api = api
+        self.app = api.WebApp()
+
+    def test_customer_flow_end_to_end(self):
+        user = self.app.api_register("priya", "secret1", "9876543210", "Delhi")
+        self.assertEqual(user["role"], "customer")
+        self.app.api_cart_add(4, 2)
+        self.app.api_cart_add(9, 2)
+        view = self.app.api_apply_coupon("WELCOME10")
+        self.assertEqual(view["bill"]["discount"], 77.0)
+        order = self.app.api_checkout("Delhi", "UPI")
+        self.assertEqual(order["status"], "PLACED")
+        self.assertEqual(self.app.api_cart()["lines"], [])
+        self.assertEqual(len(self.app.api_orders()), 1)
+        self.assertEqual(self.app.api_cancel(order["id"])["status"], "CANCELLED")
+
+    def test_admin_actions_are_protected(self):
+        self.app.api_register("priya", "secret1")
+        with self.assertRaises(ValueError):
+            self.app.api_admin_report()
+        self.app.api_logout()
+        self.app.api_login("admin", "admin123")
+        self.assertIn("total_orders", self.app.api_admin_report())
+        with self.assertRaises(ValueError):
+            self.app.api_cart_add(1)  # admins do not shop
+
+    def test_cart_and_session_persist_across_reload(self):
+        self.app.api_register("priya", "secret1")
+        self.app.api_cart_add(1, 3)
+        reloaded = self.api.WebApp()  # simulates refreshing the page
+        self.assertEqual(reloaded.api_state()["user"]["username"], "priya")
+        self.assertEqual(reloaded.api_cart()["lines"][0]["qty"], 3)
+
+    def test_invalid_coupon_dropped_when_cart_shrinks(self):
+        self.app.api_register("priya", "secret1")
+        self.app.api_cart_add(4, 1)  # 340, above FLAT50 minimum of 300
+        self.app.api_apply_coupon("FLAT50")
+        view = self.app.api_cart_set(4, 0)
+        self.assertEqual(view["coupon"], "")
+
+    def test_dispatch_returns_json_errors(self):
+        import json
+        bad = json.loads(self.api.dispatch("login", json.dumps({"username": "x", "password": "y"})))
+        self.assertFalse(bad["ok"])
+        self.assertIn("Invalid", bad["error"])
+        unknown = json.loads(self.api.dispatch("nope"))
+        self.assertFalse(unknown["ok"])
+
+
+if __name__ == "__main__":
+    unittest.main()
