@@ -240,3 +240,91 @@ def customer_session(user, auth, menu, orders):
             return
         else:
             print("  ! Invalid option.")
+
+
+# ----------------------------- admin features -----------------------------
+def admin_session(menu: MenuService, orders: OrderService):
+    while True:
+        print(f"\n{LINE}\n  ADMIN PANEL\n{LINE}")
+        print("  1. View full menu          5. Toggle item availability")
+        print("  2. Add menu item           6. Remove menu item")
+        print("  3. Update item price       7. View all orders")
+        print("  4. Update order status     8. Sales report")
+        print("  0. Logout")
+        choice = ask("  > ")
+        if choice == "1":
+            show_items(menu.search(include_unavailable=True))
+        elif choice == "2":
+            def _add():
+                item = menu.add_item(ask("  Name: "), ask("  Category: "),
+                                     ask_float("  Price: "),
+                                     ask("  Veg? (Y/n): ").lower() != "n")
+                print(f"  Added '{item.name}' with id {item.id}.")
+            safe(_add)
+        elif choice == "3":
+            safe(lambda: menu.update_price(ask_int("  Item id: "), ask_float("  New price: ")))
+        elif choice == "4":
+            def _status():
+                oid = ask_int("  Order id: ")
+                print(f"  Statuses: {', '.join(ORDER_FLOW)}")
+                o = orders.update_status(oid, ask("  New status: "))
+                print(f"  Order #{o.id} is now {o.status}.")
+            safe(_status)
+        elif choice == "5":
+            def _toggle():
+                state = menu.toggle_availability(ask_int("  Item id: "))
+                print("  Item is now " + ("available." if state else "unavailable."))
+            safe(_toggle)
+        elif choice == "6":
+            safe(lambda: menu.remove_item(ask_int("  Item id: ")))
+        elif choice == "7":
+            for o in sorted(orders.orders.values(), key=lambda o: o.id, reverse=True):
+                show_order(o, detailed=False)
+                print(f"     Customer: {o.username}")
+            if not orders.orders:
+                print("  No orders yet.")
+        elif choice == "8":
+            r = orders.sales_report()
+            print(f"\n  Total orders : {r['total_orders']}  (cancelled: {r['cancelled']})")
+            print(f"  Revenue      : Rs.{r['revenue']:.2f}")
+            print(f"  Avg rating   : {r['avg_rating'] if r['avg_rating'] else 'n/a'}")
+            print("  Top items    : " + (", ".join(f"{n} ({q})" for n, q in r["top_items"]) or "n/a"))
+        elif choice == "0":
+            return
+        else:
+            print("  ! Invalid option.")
+
+
+# --------------------------------- main -----------------------------------
+def main():
+    auth, menu = AuthService(), MenuService()
+    orders = OrderService(menu)
+    print("=" * 62)
+    print("        WELCOME TO PYTHON BITES - ONLINE FOOD ORDERING")
+    print("=" * 62)
+    while True:
+        print("\n  1. Login   2. Register   0. Exit")
+        choice = ask("  > ")
+        if choice == "1":
+            def _login():
+                user = auth.login(ask("  Username: "), ask("  Password: "))
+                if user.role == "admin":
+                    admin_session(menu, orders)
+                else:
+                    customer_session(user, auth, menu, orders)
+            safe(_login)
+        elif choice == "2":
+            def _register():
+                auth.register(ask("  Choose a username: "), ask("  Choose a password: "),
+                              ask("  Phone (10 digits, optional): "), ask("  Address (optional): "))
+                print("  Registration successful. You can now log in.")
+            safe(_register)
+        elif choice == "0":
+            print("  Thank you for visiting. Goodbye!")
+            return
+        else:
+            print("  ! Invalid option.")
+
+
+if __name__ == "__main__":
+    main()
