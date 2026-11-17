@@ -28,3 +28,40 @@ class MenuItem:
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+
+@dataclass
+class User:
+    username: str
+    password_hash: str
+    salt: str
+    role: str = "customer"  # "customer" or "admin"
+    phone: str = ""
+    address: str = ""
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass
+class Order:
+    id: int
+    username: str
+    items: list  # [{"item_id", "name", "price", "qty"}]
+    subtotal: float
+    discount: float
+    delivery_fee: float
+    tax: float
+    total: float
+    address: str
+    payment_method: str
+    coupon: str = ""
+    status: str = "PLACED"
+    created_at: str = field(
+        default_factory=lambda: datetime.now().strftime("%Y-%m-%d %H:%M")
+    )
+    rating: int = 0
+    review: str = ""
+
+    def to_dict(self) -> dict:
+        return asdict(self)
